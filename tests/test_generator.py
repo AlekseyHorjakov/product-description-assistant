@@ -37,6 +37,20 @@ SENTENCE = (
     "неагрессивных сред. "
 )
 
+# Тот же прибор, но без диаметра корпуса: на нём проверяем выдуманное «100 мм».
+PRODUCT_NO_DIAMETER = parse_product(
+    {
+        "name": "Манометр показывающий DM 02",
+        "manufacturer": "Манотомь",
+        "specs": {
+            "диапазон измерений": "0–1,6 МПа",
+            "класс точности": "1,5",
+            "присоединение": "G1/2",
+        },
+        "description": TEST_DESCRIPTION,
+    }
+)
+
 
 def make_description(length: int = 900) -> str:
     return (SENTENCE * 30)[:length]
@@ -274,13 +288,14 @@ def test_dropped_input_spec_is_reported(settings):
 
 
 def test_unknown_spec_name_is_reported(settings):
+    """Значение подтверждено, но название характеристики модель придумала."""
     card = make_card(
         key_specs=[
             {"name": "Диапазон измерений", "value": "0–1,6 МПа"},
             {"name": "Класс точности", "value": "1,5"},
             {"name": "Присоединение", "value": "G1/2"},
             {"name": "Диаметр корпуса", "value": "100 мм"},
-            {"name": "Габаритные размеры", "value": "не указаны"},
+            {"name": "Габаритные размеры", "value": "100 мм"},
         ]
     )
 
@@ -310,6 +325,198 @@ def test_related_spec_name_is_not_reported(settings):
     result = generate_card(PRODUCT, settings, completion_fn=fake_llm)
 
     assert not any("Тип прибора" in warning for warning in result.warnings)
+
+
+def test_invented_diameter_is_caught(settings):
+    """Во входных данных нет диаметра, а модель добавила «100 мм»."""
+    card = make_card()  # в карточке есть «Диаметр корпуса: 100 мм»
+
+    def fake_llm(_messages, _settings):
+        return answer(card)
+
+    result = generate_card(PRODUCT_NO_DIAMETER, settings, completion_fn=fake_llm)
+
+    assert result.attempts == 2
+    assert any("100" in warning and "исключена" in warning for warning in result.warnings)
+    assert all("100 мм" not in spec.value for spec in result.card.key_specs)
+
+
+def test_confirmed_diameter_is_kept(settings):
+    """Диаметр 100 мм есть во входных данных — ошибки быть не должно."""
+    def fake_llm(_messages, _settings):
+        return answer(make_card())
+
+    result = generate_card(PRODUCT, settings, completion_fn=fake_llm)
+
+    assert result.warnings == []
+    assert any(
+        spec.name == "Диаметр корпуса" and spec.value == "100 мм"
+        for spec in result.card.key_specs
+    )
+
+
+def test_all_confirmed_specs_are_kept(settings):
+    def fake_llm(_messages, _settings):
+        return answer(make_card())
+
+    result = generate_card(PRODUCT, settings, completion_fn=fake_llm)
+
+    names = {spec.name for spec in result.card.key_specs}
+    assert {"Диапазон измерений", "Класс точности", "Присоединение", "Диаметр корпуса"} <= names
+
+
+def test_invented_text_spec_is_caught(settings):
+    """Проверка текстовых значений, а не только чисел."""
+    card = make_card(
+        key_specs=[
+            {"name": "Диапазон измерений", "value": "0–1,6 МПа"},
+            {"name": "Класс точности", "value": "1,5"},
+            {"name": "Присоединение", "value": "G1/2"},
+            {"name": "Диаметр корпуса", "value": "100 мм"},
+            {"name": "Материал корпуса", "value": "латунь"},
+        ]
+    )
+
+    def fake_llm(_messages, _settings):
+        return answer(card)
+
+    result = generate_card(PRODUCT, settings, completion_fn=fake_llm)
+
+    assert any("латунь" in warning and "исключена" in warning for warning in result.warnings)
+    assert all(spec.name != "Материал корпуса" for spec in result.card.key_specs)
+
+
+def test_morphological_variant_is_not_flagged(settings):
+    """«нержавеющая сталь» и «нержавеющей стали» — одно и то же значение."""
+    product = parse_product(
+        {
+            "name": "Манометр показывающий DM 02",
+            "manufacturer": "Манотомь",
+            "specs": {
+                "диапазон измерений": "0–1,6 МПа",
+                "класс точности": "1,5",
+                "присоединение": "G1/2",
+                "диаметр корпуса": "100 мм",
+            },
+            "description": "Корпус прибора выполнен из нержавеющей стали.",
+        }
+    )
+    card = make_card(
+        key_specs=[
+            {"name": "Диапазон измерений", "value": "0–1,6 МПа"},
+            {"name": "Класс точности", "value": "1,5"},
+            {"name": "Присоединение", "value": "G1/2"},
+            {"name": "Диаметр корпуса", "value": "100 мм"},
+            {"name": "Материал корпуса", "value": "нержавеющая сталь"},
+        ]
+    )
+
+    def fake_llm(_messages, _settings):
+        return answer(card)
+
+    result = generate_card(product, settings, completion_fn=fake_llm)
+
+    assert not any("исключена" in warning for warning in result.warnings)
+    assert any(spec.name == "Материал корпуса" for spec in result.card.key_specs)
+
+
+def test_reliability_claim_is_caught(settings):
+    """«Стабильная и надёжная работа» — неподтверждённое утверждение."""
+    card = make_card(commercial_block="Прибор обеспечивает стабильную и надёжную работу.")
+
+    def fake_llm(_messages, _settings):
+        return answer(card)
+
+    result = generate_card(PRODUCT, settings, completion_fn=fake_llm)
+
+    assert any("стабильность" in warning for warning in result.warnings)
+    assert any("надёжность" in warning for warning in result.warnings)
+
+
+def test_too_many_no_data_is_limited(settings):
+    """Не более трёх «Данных нет»; остальное уходит в missing_data."""
+    card = make_card(
+        key_specs=[
+            {"name": "Диапазон измерений", "value": "0–1,6 МПа"},
+            {"name": "Класс точности", "value": "1,5"},
+            {"name": "Присоединение", "value": "G1/2"},
+            {"name": "Диаметр корпуса", "value": "100 мм"},
+            {"name": "Питание", "value": "Данных нет"},
+            {"name": "Степень защиты корпуса", "value": "Данных нет"},
+            {"name": "Материал корпуса", "value": "Данных нет"},
+            {"name": "Температурный диапазон", "value": "Данных нет"},
+        ]
+    )
+
+    def fake_llm(_messages, _settings):
+        return answer(card)
+
+    result = generate_card(PRODUCT, settings, completion_fn=fake_llm)
+
+    no_data = [spec for spec in result.card.key_specs if spec.value == "Данных нет"]
+    assert len(no_data) == 3
+    assert len(result.card.key_specs) == 7  # подтверждённые характеристики не удалены
+    assert any("перенесено в missing_data" in warning for warning in result.warnings)
+    assert result.card.missing_data
+
+
+def test_retry_does_not_fix_fabrication(settings):
+    """Повторная генерация не помогла — нарушение видно в предупреждениях."""
+    card = make_card(
+        key_specs=[
+            {"name": "Диапазон измерений", "value": "0–1,6 МПа"},
+            {"name": "Класс точности", "value": "1,5"},
+            {"name": "Присоединение", "value": "G1/2"},
+            {"name": "Диаметр корпуса", "value": "100 мм"},
+            {"name": "Материал корпуса", "value": "латунь"},
+        ]
+    )
+
+    def fake_llm(_messages, _settings):
+        return answer(card)
+
+    result = generate_card(PRODUCT, settings, completion_fn=fake_llm)
+
+    assert result.attempts == 2
+    assert any("латунь" in warning for warning in result.warnings)
+    assert all(spec.name != "Материал корпуса" for spec in result.card.key_specs)
+
+
+def test_better_attempt_is_kept(settings):
+    """Повторный ответ хуже первого — остаётся лучший вариант."""
+    first = make_card(seo_title="М" * 80)  # одно нарушение: длина заголовка
+    second = make_card(
+        seo_description="Слишком коротко.",
+        key_specs=[
+            {"name": "Диапазон измерений", "value": "0–1,6 МПа"},
+            {"name": "Материал корпуса", "value": "латунь"},
+        ],
+    )
+    answers = [answer(first), answer(second)]
+
+    def fake_llm(_messages, _settings):
+        return answers.pop(0)
+
+    result = generate_card(PRODUCT, settings, completion_fn=fake_llm)
+
+    assert result.attempts == 2
+    assert len(result.card.seo_title) == 80
+    assert any("70" in warning for warning in result.warnings)
+    assert not any("латунь" in warning for warning in result.warnings)
+
+
+def test_retry_parse_error_keeps_first_card(settings):
+    """Если повторный ответ сломан, первая корректная карточка не теряется."""
+    answers = [answer(make_card(seo_description="Коротко")), "это не JSON"]
+
+    def fake_llm(_messages, _settings):
+        return answers.pop(0)
+
+    result = generate_card(PRODUCT, settings, completion_fn=fake_llm)
+
+    assert result.attempts == 2
+    assert any("не удалось разобрать" in warning for warning in result.warnings)
+    assert any("короче 800" in warning for warning in result.warnings)
 
 
 def test_missing_data_from_model_is_kept(settings):

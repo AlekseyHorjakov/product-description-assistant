@@ -30,12 +30,20 @@ SEARCH_QUERIES_MAX = 5
 # Единая пометка для отсутствующих сведений (требование ТЗ)
 NO_DATA = "Данных нет"
 
+# Больше трёх характеристик со значением «Данных нет» показывать нельзя:
+# остальные отсутствующие сведения уходят в missing_data.
+MAX_NO_DATA_SPECS = 3
+
 # Человеческие названия полей для сообщений об ошибках
 FIELD_LABELS = {
     "name": "название товара",
     "manufacturer": "производитель",
     "specs": "технические характеристики",
     "description": "описание",
+    "article": "артикул",
+    "price": "цена",
+    "offer_id": "ID предложения",
+    "url": "ссылка на товар",
 }
 
 
@@ -49,7 +57,14 @@ class ProductInput(BaseModel):
     specs: dict[str, str] = Field(default_factory=dict)
     description: str = Field(default="", max_length=20000)
 
-    @field_validator("name", "manufacturer", "description", mode="before")
+    # Данные каталога, которые не участвуют в генерации текста карточки.
+    # Цена намеренно хранится отдельно и не попадает в характеристики.
+    article: str = Field(default="", max_length=100)
+    price: str = Field(default="", max_length=50)
+    offer_id: str = Field(default="", max_length=50)
+    url: str = Field(default="", max_length=500)
+
+    @field_validator("name", "manufacturer", "description", "article", "price", "offer_id", "url", mode="before")
     @classmethod
     def _as_text(cls, value: Any) -> Any:
         """Число в поле текста превращаем в строку, остальное отдаём Pydantic."""

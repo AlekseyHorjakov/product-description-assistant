@@ -1,0 +1,17 @@
+{
+  "_comment": "Данные из feed.xml, offer id=194299. В выгрузке есть только name, typePrefix, vendor, vendorCode, price, url и param Артикул/Код товара. Технического описания (description) в выгрузке нет, поэтому поле description пустое. Характеристики типа/модели/зондов взяты дословно из name и typePrefix.",
+  "name": "RGK CT-12 с зондом температуры воздуха TR-10A, поверхностным зондом TR-10S и погружным зондом температуры TR-10W",
+  "manufacturer": "RGK",
+  "article": "779791",
+  "price": "15160 RUB",
+  "offer_id": "194299",
+  "url": "https://www.souz-pribor.ru/product/termometr-rgk-ct-12-s-zondom-temperatury-vozdukha-tr-10a-poverkhnostnym-zondom-tr-10s-i-pogruzhnym-z/",
+  "specs": {
+    "Тип прибора": "термометр",
+    "Модель": "RGK CT-12",
+    "Зонд температуры воздуха": "TR-10A",
+    "Поверхностный зонд": "TR-10S",
+    "Погружной зонд температуры": "TR-10W"
+  },
+  "description": ""
+}

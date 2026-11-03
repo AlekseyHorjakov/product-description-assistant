@@ -76,9 +76,21 @@ def _render_result(result: GenerationResult, product: ProductInput) -> None:
         )
     else:
         st.success(
-            "Проверки пройдены: длины в норме, незаявленных чисел, единиц измерения "
-            "и рекламных обещаний не найдено."
+            "Проверки пройдены: длины в норме, все характеристики подтверждены входными данными, "
+            "выдуманных значений и рекламных обещаний не найдено."
         )
+
+    catalog_parts = []
+    if product.article:
+        catalog_parts.append(f"артикул {product.article}")
+    if product.price:
+        catalog_parts.append(f"цена {product.price}")
+    if product.offer_id:
+        catalog_parts.append(f"offer {product.offer_id}")
+    if product.url:
+        catalog_parts.append(f"[ссылка на товар]({product.url})")
+    if catalog_parts:
+        st.caption("Данные каталога: " + " · ".join(catalog_parts))
 
     if card.missing_data:
         st.info(
@@ -181,18 +193,34 @@ with tab_form:
 # --- Вариант Б: JSON ------------------------------------------------------
 
 with tab_json:
-    st.caption('Ожидаются поля "name", "manufacturer", "specs" и "description".')
-    example_left, example_right = st.columns(2)
-    example_left.button(
+    st.caption(
+        'Ожидаются поля "name", "manufacturer", "specs" и "description". '
+        'Необязательные поля каталога: "article", "price", "offer_id", "url".'
+    )
+    example_row_1 = st.columns(2)
+    example_row_1[0].button(
         "Пример 1: манометр DM 02 (данные из ТЗ)",
         on_click=_load_example,
         args=("product_1_manotom_dm02.json",),
         use_container_width=True,
     )
-    example_right.button(
+    example_row_1[1].button(
         "Пример 2: искусственные данные",
         on_click=_load_example,
         args=("product_2_artificial_pressure_transmitter.json",),
+        use_container_width=True,
+    )
+    example_row_2 = st.columns(2)
+    example_row_2[0].button(
+        "Пример 3: RGK CT-12 (каталог, offer 194299)",
+        on_click=_load_example,
+        args=("catalog_rgk_ct12.json",),
+        use_container_width=True,
+    )
+    example_row_2[1].button(
+        "Пример 4: ОВЕН ПД180 (каталог, offer 472728)",
+        on_click=_load_example,
+        args=("catalog_oven_pd180.json",),
         use_container_width=True,
     )
 

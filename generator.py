@@ -23,12 +23,14 @@ from config import Settings
 from errors import ResponseFormatError
 from llm_client import request_completion
 from models import (
+    MAX_NO_DATA_SPECS,
     NO_DATA,
     SEARCH_QUERIES_MAX,
     SEARCH_QUERIES_MIN,
     SEO_DESCRIPTION_MAX,
     SEO_DESCRIPTION_MIN,
     SEO_TITLE_MAX,
+    KeySpec,
     ProductCard,
     ProductInput,
 )
@@ -86,7 +88,15 @@ FORBIDDEN_CLAIMS = {
     r"бесплатн\w*": "бесплатно",
     r"скидк\w*": "скидка",
     r"стандарт\w*": "стандарт",
-    r"надежн\w*": "надёжность",
+    r"над[её]жн\w*": "надёжность",
+    r"стабильн\w*": "стабильность",
+    r"долговечн\w*": "долговечность",
+    r"безотказн\w*": "безотказность",
+    r"качествен\w*": "качество",
+    r"высок\w*": "высокие показатели",
+    r"идеальн\w*": "идеальное решение",
+    r"универсальн\w*": "универсальность",
+    r"профессиональн\w*": "профессиональный",
 }
 
 # Служебные слова не участвуют в сравнении названий характеристик.
@@ -94,6 +104,16 @@ STOPWORDS = {"для", "или", "при", "без", "тип", "вид", "это
 
 # «не» + слово: ловим смысловые перевороты («неагрессивные» -> «агрессивные»).
 NEGATED_WORD_RE = re.compile(r"\bне([а-яёa-z]{6,})", re.IGNORECASE)
+
+# Варианты пометки, которыми модель обозначает отсутствие сведений.
+NO_DATA_VARIANTS = {
+    "данных нет",
+    "нет данных",
+    "нет сведений",
+    "не указано",
+    "не указаны",
+    "н/д",
+}
 
 CARD_FIELDS = {
     "seo_title": "SEO-заголовок",
@@ -161,10 +181,22 @@ def generate_card(
 
     completion_fn подменяется в тестах на функцию-заглушку, поэтому
     тесты не ходят в сеть.
+
+    Порядок работы:
+    1. Запрос к модели и разбор ответа.
+    2. Полная проверка ответа.
+    3. Если есть нарушения — один повторный запрос с их списком.
+    4. Из всех вариантов берётся тот, где нарушений меньше: повторный
+       ответ не должен ухудшать карточку.
+    5. Перед выдачей карточка очищается от неподтверждённых характеристик,
+       после чего проверки запускаются заново.
     """
     prompt = build_user_prompt(product)
-    card: ProductCard | None = None
-    problems: list[str] = []
+    best_card: ProductCard | None = None
+    best_problems: list[str] = []
+    best_prompt = prompt
+    fixes: list[str] = []
+    attempt = 0
 
     for attempt in range(1, MAX_ATTEMPTS + 1):
         messages = [
@@ -176,28 +208,38 @@ def generate_card(
         try:
             card = parse_card_response(raw_answer)
         except ResponseFormatError as exc:
-            if attempt == MAX_ATTEMPTS:
-                raise
-            problems = [str(exc)]
-            prompt = build_retry_prompt(product, problems)
-            continue
+            if best_card is None:
+                if attempt == MAX_ATTEMPTS:
+                    raise
+                prompt = build_retry_prompt(product, [str(exc)])
+                continue
+            # Повторный ответ сломан, но первая карточка уже есть — отдаём её.
+            fixes.append(f"Повторный ответ модели не удалось разобрать: {exc}")
+            break
 
         problems = find_problems(card, product)
+        if best_card is None or len(problems) < len(best_problems):
+            best_card, best_problems, best_prompt = card, problems, prompt
         if not problems:
             break
         if attempt < MAX_ATTEMPTS:
             prompt = build_retry_prompt(product, problems)
 
-    if card is None:  # защита от неверного изменения логики
+    if best_card is None:  # защита от неверного изменения логики
         raise ResponseFormatError("Модель не вернула карточку товара.")
 
-    warnings = find_soft_warnings(card, product) + problems
+    card, finalize_warnings = _finalize_card(best_card, product)
+
+    # После правки карточки проверки обязательно запускаются заново.
+    problems = find_problems(card, product)
+    warnings = _dedupe(fixes + finalize_warnings + problems + find_soft_warnings(card, product))
+
     return GenerationResult(
         card=card,
         warnings=warnings,
         attempts=attempt,
         model=settings.model,
-        prompt=prompt,
+        prompt=best_prompt,
     )
 
 
@@ -278,12 +320,12 @@ def find_problems(card: ProductCard, product: ProductInput) -> list[str]:
     if description_length < SEO_DESCRIPTION_MIN:
         problems.append(
             f"SEO-описание короче {SEO_DESCRIPTION_MIN} символов: сейчас {description_length}. "
-            "Доведи объём до 800–1200 символов, используя только данные из запроса."
+            f"Нужно {SEO_DESCRIPTION_MIN}–{SEO_DESCRIPTION_MAX} символов, только за счёт данных из запроса."
         )
     elif description_length > SEO_DESCRIPTION_MAX:
         problems.append(
             f"SEO-описание длиннее {SEO_DESCRIPTION_MAX} символов: сейчас {description_length}. "
-            "Сократи текст."
+            "Текст нужно сократить."
         )
 
     queries_count = len(card.search_queries)
@@ -296,25 +338,77 @@ def find_problems(card: ProductCard, product: ProductInput) -> list[str]:
     if not card.key_specs:
         problems.append("Список ключевых характеристик пуст.")
 
-    problems += _unknown_numbers(card, product)
+    problems += _spec_problems(card, product)
+    problems += _text_number_problems(card, product)
+    problems += _no_data_problems(card)
+    problems += _missing_input_specs(card, product)
     problems += _forbidden_claims(card, product)
     problems += _negation_flips(card, product)
     return _dedupe(problems)
 
 
-def _unknown_numbers(card: ProductCard, product: ProductInput) -> list[str]:
-    """Ищет числа, которых нет во входных данных (признак выдумки)."""
+def _spec_problems(card: ProductCard, product: ProductInput) -> list[str]:
+    """Характеристики, значение которых не подтверждается входными данными.
+
+    Проверяются и числа с единицами, и текстовые значения (материалы,
+    интерфейсы, типы исполнения): модель не должна добавлять того, чего
+    нет во входных данных, даже если это «просто слово».
+    """
+    source_text = _product_text(product)
+    source_numbers = _collect_numbers(source_text)
+    source_tokens = _tokens(source_text)
+
+    problems: list[str] = []
+    for spec in card.key_specs:
+        if _is_no_data(spec.value):
+            continue
+        reason = _value_problem(spec.value, source_numbers, source_tokens)
+        if reason:
+            problems.append(
+                f"Характеристика «{spec.name}: {spec.value}» не подтверждается входными данными: "
+                f"{reason}. Убери её или замени значение на «Данных нет»."
+            )
+    return problems
+
+
+def _value_problem(
+    value: str,
+    source_numbers: dict[str, set[str]],
+    source_tokens: set[str],
+) -> str | None:
+    """Возвращает причину, по которой значение нельзя подтвердить, или None."""
+    reasons: list[str] = []
+
+    for raw_number, spaces, raw_unit in NUMBER_RE.findall(value):
+        number = _normalize_number(raw_number)
+        if number not in source_numbers:
+            reasons.append(f"значения «{raw_number}» нет во входных данных")
+            continue
+        unit = _parse_unit(raw_unit, spaces)
+        if unit and unit not in source_numbers[number] and "" not in source_numbers[number]:
+            reasons.append(f"единица «{unit}» у значения «{raw_number}» не совпадает с исходными данными")
+
+    unknown_words = sorted(token for token in _tokens(value) if not _tokens_match({token}, source_tokens))
+    if unknown_words:
+        shown = ", ".join(f"«{word}»" for word in unknown_words)
+        reasons.append(f"слов {shown} нет во входных данных")
+
+    return "; ".join(reasons) if reasons else None
+
+
+def _text_number_problems(card: ProductCard, product: ProductInput) -> list[str]:
+    """Ищет числа, которых нет во входных данных, в свободном тексте карточки."""
     known = _collect_numbers(_product_text(product))
     problems: list[str] = []
 
-    for label, text in _output_fields(card):
+    for label, text in _free_text_fields(card):
         for raw_number, spaces, raw_unit in NUMBER_RE.findall(text):
             number = _normalize_number(raw_number)
             if number not in known:
                 shown = f"{raw_number} {raw_unit}".strip() if raw_unit else raw_number
                 problems.append(
                     f"В поле «{label}» есть значение «{shown}», которого нет во входных данных. "
-                    "Убери его или замени на «Данных нет»."
+                    "Уберите его из текста."
                 )
                 continue
 
@@ -323,9 +417,73 @@ def _unknown_numbers(card: ProductCard, product: ProductInput) -> list[str]:
                 expected = ", ".join(sorted(item for item in known[number] if item))
                 problems.append(
                     f"В поле «{label}» у значения «{raw_number}» единица «{unit}» не совпадает "
-                    f"с исходными данными ({expected or 'без единицы'}). Исправь единицу измерения."
+                    f"с исходными данными ({expected or 'без единицы'}). Проверьте единицу измерения."
                 )
     return problems
+
+
+def _no_data_problems(card: ProductCard) -> list[str]:
+    """Лимит характеристик со значением «Данных нет»."""
+    count = sum(1 for spec in card.key_specs if _is_no_data(spec.value))
+    if count <= MAX_NO_DATA_SPECS:
+        return []
+    return [
+        f"Характеристик со значением «{NO_DATA}» больше {MAX_NO_DATA_SPECS} (сейчас {count}). "
+        "Оставь не более трёх, а остальные сведения перечисли в missing_data."
+    ]
+
+
+def _finalize_card(card: ProductCard, product: ProductInput) -> tuple[ProductCard, list[str]]:
+    """Готовит карточку к показу: убирает то, что не подтверждено данными.
+
+    Неподтверждённые характеристики нельзя оставлять в таблице как факт,
+    поэтому они исключаются, а сведения о них уходят в missing_data.
+    Лишние «Данных нет» сверх лимита переносятся туда же.
+    Возвращает исправленную карточку и список пояснений для пользователя.
+    """
+    source_text = _product_text(product)
+    source_numbers = _collect_numbers(source_text)
+    source_tokens = _tokens(source_text)
+
+    kept: list[KeySpec] = []
+    warnings: list[str] = []
+    missing = list(card.missing_data)
+
+    for spec in card.key_specs:
+        if _is_no_data(spec.value):
+            kept.append(spec)
+            continue
+        reason = _value_problem(spec.value, source_numbers, source_tokens)
+        if reason:
+            warnings.append(
+                f"Характеристика «{spec.name}: {spec.value}» исключена из карточки: {reason}."
+            )
+            missing.append(f"Требует подтверждения: {spec.name}")
+            continue
+        kept.append(spec)
+
+    no_data_specs = [spec for spec in kept if _is_no_data(spec.value)]
+    if len(no_data_specs) > MAX_NO_DATA_SPECS:
+        extra = no_data_specs[MAX_NO_DATA_SPECS:]
+        kept = [spec for spec in kept if spec not in extra]
+        for spec in extra:
+            warnings.append(
+                f"«{spec.name}: {NO_DATA}» перенесено в missing_data: "
+                f"допустимо не более {MAX_NO_DATA_SPECS} таких характеристик."
+            )
+            missing.append(f"Требует уточнения: {spec.name}")
+
+    if warnings:
+        card = card.model_copy(
+            update={"key_specs": kept, "missing_data": _dedupe(missing)}
+        )
+    return card, warnings
+
+
+def _is_no_data(value: str) -> bool:
+    """Разные варианты пометки «данных нет» приводим к одному признаку."""
+    text = value.strip().lower().rstrip(".")
+    return text in NO_DATA_VARIANTS
 
 
 def _forbidden_claims(card: ProductCard, product: ProductInput) -> list[str]:
@@ -339,8 +497,7 @@ def _forbidden_claims(card: ProductCard, product: ProductInput) -> list[str]:
         for label, text in _output_fields(card):
             if re.search(pattern, _normalize_value(text)):
                 problems.append(
-                    f"В поле «{label}» упоминается «{title}», хотя во входных данных этого нет. "
-                    "Убери утверждение."
+                    f"В поле «{label}» упоминается «{title}», хотя во входных данных этого нет."
                 )
                 break
     return problems
@@ -361,7 +518,7 @@ def _negation_flips(card: ProductCard, product: ProductInput) -> list[str]:
             if _has_unnegated(_normalize_value(text), positive):
                 problems.append(
                     f"В поле «{label}» слово «{positive}» стоит без отрицания, хотя во входных "
-                    f"данных сказано «не{positive}». Проверь смысл и верни отрицание."
+                    f"данных сказано «не{positive}»."
                 )
                 break
     return problems
@@ -381,7 +538,6 @@ def find_soft_warnings(card: ProductCard, product: ProductInput) -> list[str]:
     """Замечания, из-за которых не стоит повторять запрос."""
     warnings: list[str] = []
     warnings += _input_data_gaps(product)
-    warnings += _missing_input_specs(card, product)
     warnings += _unknown_spec_names(card, product)
     return _dedupe(warnings)
 
@@ -408,21 +564,24 @@ def _missing_input_specs(card: ProductCard, product: ProductInput) -> list[str]:
     """Проверяет, что характеристики из входных данных попали в карточку."""
     card_text = "\n".join(text for _, text in _output_fields(card))
     card_numbers = _collect_numbers(card_text)
-    card_normalized = _normalize_value(card_text)
+    card_tokens = _tokens(card_text)
 
-    warnings: list[str] = []
+    problems: list[str] = []
     for name, value in product.specs.items():
         numbers = [_normalize_number(raw) for raw, _, _ in NUMBER_RE.findall(value)]
         if numbers:
             present = all(number in card_numbers for number in numbers)
         else:
-            present = _normalize_value(value) in card_normalized
+            value_tokens = _tokens(value)
+            present = not value_tokens or all(
+                _tokens_match({token}, card_tokens) for token in value_tokens
+            )
 
         if not present:
-            warnings.append(
-                f"Характеристика «{name}: {value}» из входных данных не попала в карточку — добавьте вручную."
+            problems.append(
+                f"Характеристика «{name}: {value}» из входных данных не попала в карточку."
             )
-    return warnings
+    return problems
 
 
 def _unknown_spec_names(card: ProductCard, product: ProductInput) -> list[str]:
@@ -431,7 +590,7 @@ def _unknown_spec_names(card: ProductCard, product: ProductInput) -> list[str]:
     warnings: list[str] = []
 
     for spec in card.key_specs:
-        if spec.value.strip().lower() == NO_DATA.lower():
+        if _is_no_data(spec.value):
             continue
         name_tokens = _tokens(spec.name)
         if name_tokens and not _tokens_match(name_tokens, input_tokens):
@@ -448,6 +607,17 @@ def _product_text(product: ProductInput) -> str:
     parts = [product.name, product.manufacturer, product.description]
     parts += [f"{name}: {value}" for name, value in product.specs.items()]
     return "\n".join(parts)
+
+
+def _free_text_fields(card: ProductCard) -> list[tuple[str, str]]:
+    """Свободный текст карточки: заголовок, описание, блок и запросы."""
+    fields = [
+        ("SEO-заголовок", card.seo_title),
+        ("SEO-описание", card.seo_description),
+        ("Коммерческий блок", card.commercial_block),
+    ]
+    fields += [(f"Поисковый запрос «{query}»", query) for query in card.search_queries]
+    return fields
 
 
 def _output_fields(card: ProductCard) -> list[tuple[str, str]]:
@@ -513,12 +683,13 @@ def _tokens(text: str) -> set[str]:
 def _tokens_match(first: set[str], second: set[str]) -> bool:
     """Считаем слова совпавшими с учётом простых словоформ.
 
-    «прибор» и «прибора», «измерение» и «измерений» должны считаться одним
-    словом, поэтому сравниваем вхождение и первые пять букв.
+    «прибор» и «прибора», «сталь» и «стали», «измерение» и «измерений»
+    должны считаться одним словом, поэтому сравниваем вхождение и первые
+    четыре буквы.
     """
     for left in first:
         for right in second:
-            if left in right or right in left or left[:5] == right[:5]:
+            if left in right or right in left or left[:4] == right[:4]:
                 return True
     return False
 
