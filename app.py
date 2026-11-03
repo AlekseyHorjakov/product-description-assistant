@@ -29,6 +29,22 @@ st.set_page_config(page_title="AI-помощник: карточки товар�
 
 EXAMPLES_DIR = Path(__file__).resolve().parent / "examples"
 
+# Готовые карточки, которые уже лежат в репозитории. Это именно результаты
+# генерации, а не исходные данные: вкладка только читает файлы и ничего
+# не отправляет в LLM.
+READY_EXAMPLES = (
+    {
+        "title": "RGK CT-12 — термометр с тремя зондами",
+        "markdown": "results/catalog_rgk_ct12.md",
+        "json": "results/catalog_rgk_ct12.json",
+    },
+    {
+        "title": "ОВЕН ПД180 — датчик-преобразователь давления",
+        "markdown": "results/catalog_oven_pd180.md",
+        "json": "results/catalog_oven_pd180.json",
+    },
+)
+
 try:
     settings = load_settings()
 except AppError as exc:  # например, в .env число записано текстом
@@ -45,6 +61,22 @@ def _slug(text: str) -> str:
 def _load_example(filename: str) -> None:
     """Колбэк кнопки: подставляет пример в поле JSON."""
     st.session_state["json_input"] = (EXAMPLES_DIR / filename).read_text(encoding="utf-8")
+
+
+def _read_example_file(relative_path: str) -> str | None:
+    """Читает готовый файл примера и не роняет приложение при ошибке.
+
+    Возвращает текст файла или None. Если файла нет или он не читается,
+    пользователь видит понятное сообщение, а остальные вкладки работают.
+    """
+    path = EXAMPLES_DIR / relative_path
+    try:
+        return path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        st.error(f"Файл примера не найден: `examples/{relative_path}`.")
+    except (OSError, UnicodeDecodeError) as exc:
+        st.error(f"Не удалось прочитать файл `examples/{relative_path}`: {exc}")
+    return None
 
 
 def _run_generation(raw: dict | str) -> None:
@@ -152,7 +184,7 @@ st.write(
     "товара для B2B-каталога и проверит ответ модели."
 )
 
-tab_form, tab_json = st.tabs(["Форма", "JSON"])
+tab_form, tab_json, tab_examples = st.tabs(["Форма", "JSON", "Готовые примеры"])
 
 # --- Вариант А: веб-форма -------------------------------------------------
 
@@ -240,6 +272,47 @@ with tab_json:
             st.json(product_preview.model_dump())
         except AppError as exc:
             st.error(str(exc))
+
+# --- Вкладка В: готовые примеры -------------------------------------------
+
+with tab_examples:
+    st.caption(
+        "Сохранённые карточки из `examples/results/`. Просмотр не обращается к LLM "
+        "и не требует API-ключа."
+    )
+
+    example_tabs = st.tabs([item["title"] for item in READY_EXAMPLES])
+    for example_tab, item in zip(example_tabs, READY_EXAMPLES):
+        with example_tab:
+            markdown = _read_example_file(item["markdown"])
+            if markdown is None:
+                continue
+
+            st.subheader(item["title"])
+            st.markdown(markdown)
+
+            download_columns = st.columns(2)
+            download_columns[0].download_button(
+                "Скачать Markdown",
+                data=markdown,
+                file_name=Path(item["markdown"]).name,
+                mime="text/markdown",
+                key=f"download_md_{item['markdown']}",
+            )
+
+            json_path = EXAMPLES_DIR / item["json"]
+            if json_path.is_file():
+                json_text = _read_example_file(item["json"])
+                if json_text is not None:
+                    download_columns[1].download_button(
+                        "Скачать JSON",
+                        data=json_text,
+                        file_name=json_path.name,
+                        mime="application/json",
+                        key=f"download_json_{item['json']}",
+                    )
+            else:
+                download_columns[1].caption("Готовый JSON для этого примера отсутствует.")
 
 # --- Результат ------------------------------------------------------------
 
