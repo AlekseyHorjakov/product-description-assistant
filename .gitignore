@@ -1,0 +1,22 @@
+# Секреты и локальные настройки
+.env
+.streamlit/secrets.toml
+
+# Виртуальное окружение
+.venv/
+venv/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# Логи и служебные файлы
+*.log
+.DS_Store
+Thumbs.db
+
+# Редакторы
+.idea/
+.vscode/
